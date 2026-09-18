@@ -1,0 +1,7 @@
+# 只跟踪插件源码，忽略构建产物
+*.so
+*.dll
+*.dylib
+gocache/
+gopath/
+.DS_Store
