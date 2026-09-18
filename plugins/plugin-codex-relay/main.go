@@ -36,7 +36,6 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -124,11 +123,24 @@ type authRefreshResponse struct {
 }
 
 type pluginConfig struct {
-	Enabled bool
-	BaseURL string
-	Mode    string
-	Headers map[string]string
+	Enabled  bool
+	BaseURL  string
+	Mode     string
+	Headers  map[string]string
+	Password string
 }
+
+// accessCookieName carries the plugin's own session token. The management panel
+// renders plugin pages inside an iframe and never forwards the CPA management
+// key, so the plugin issues its own cookie instead.
+const accessCookieName = "cpa_codex_relay"
+
+var sessionState = struct {
+	mu     sync.Mutex
+	tokens map[string]time.Time
+}{tokens: make(map[string]time.Time)}
+
+const sessionTTL = 12 * time.Hour
 
 type registration struct {
 	SchemaVersion uint32          `json:"schema_version"`
@@ -274,6 +286,8 @@ func parsePluginConfig(raw []byte) pluginConfig {
 				cfg.BaseURL = value
 			case "mode":
 				cfg.Mode = value
+			case "password":
+				cfg.Password = value
 			case "headers":
 				inHeaders = strings.TrimSpace(value) == ""
 			}
@@ -309,6 +323,9 @@ func configFromMap(decoded map[string]any) pluginConfig {
 	}
 	if v, ok := decoded["mode"].(string); ok && strings.TrimSpace(v) != "" {
 		cfg.Mode = strings.TrimSpace(v)
+	}
+	if v, ok := decoded["password"].(string); ok {
+		cfg.Password = strings.TrimSpace(v)
 	}
 	if headers, ok := decoded["headers"].(map[string]any); ok {
 		for name, value := range headers {
@@ -354,6 +371,7 @@ func pluginRegistration() registration {
 				{"Name": "base_url", "Type": "string", "Description": "Upstream Codex base URL, e.g. http://172.19.0.1:8320/backend-api/codex"},
 				{"Name": "mode", "Type": "enum", "EnumValues": []string{"all", "optin"}, "Description": "all = adopt every codex OAuth file; optin = only marked files."},
 				{"Name": "headers", "Type": "object", "Description": "Extra upstream headers injected on every adopted auth request."},
+				{"Name": "password", "Type": "string", "Description": "Access password for the browser configuration page. Leave empty to allow open access."},
 			},
 		},
 		Capabilities: map[string]bool{
@@ -521,12 +539,20 @@ func managementRegistration() map[string]any {
 		"resources": []map[string]string{
 			{
 				"Path":        "/home",
-				"Menu":        "Codex Relay Router",
-				"Description": "Opens the authenticated configuration page.",
+				"Menu":        "Codex 上游路由",
+				"Description": "Codex Relay Router 配置页。",
+			},
+			{
+				"Path":        "/ui",
+				"Menu":        "",
+				"Description": "Codex Relay Router configuration page (rendered in the panel iframe).",
 			},
 		},
 	}
 }
+
+// resourceBase is the prefix CPA serves plugin resource routes under.
+const resourceBase = "/v0/resource/plugins/plugin-codex-relay"
 
 func managementHandle(raw []byte) ([]byte, error) {
 	var req managementRequest
@@ -538,37 +564,64 @@ func managementHandle(raw []byte) ([]byte, error) {
 	method := strings.ToUpper(strings.TrimSpace(req.Method))
 	path := strings.TrimRight(strings.TrimSpace(req.Path), "/")
 
+	// Browser-reachable configuration page. CPA only routes GET to resource
+	// routes, so login and save are expressed as GET + query too.
 	switch {
-	case method == "GET" && path == "/v0/management/codex-relay/ui":
-		return okEnvelope(htmlResponse(renderUI(savedMessageFromQuery(req.Query))))
-	case method == "GET" && path == "/v0/resource/plugins/plugin-codex-relay/home":
-		return okEnvelope(htmlResponse(renderMenuLanding()))
+	case method == "GET" && path == resourceBase+"/ui":
+		return handleUI(&req)
+	case method == "GET" && path == resourceBase+"/home":
+		return handleUI(&req)
 	case method == "GET" && path == "/v0/management/codex-relay/status":
 		return okEnvelope(jsonResponse(statusReport()))
-	case method == "POST" && path == "/v0/management/codex-relay/config":
-		return applyConfigForm(req.Body)
 	default:
 		return okEnvelope(jsonErrorResponse(404, "not found: "+method+" "+path))
 	}
 }
 
-func savedMessageFromQuery(query map[string][]string) string {
-	if query == nil {
-		return ""
+// handleUI gates the configuration page behind the plugin's own access
+// password. The management panel cannot pass the CPA management key into its
+// iframe, so this is the only way to make the page usable from a browser.
+func handleUI(req *managementRequest) ([]byte, error) {
+	query := queryFirst(req.Query)
+	expected := currentPassword()
+
+	// No password configured: the page is open, matching the plugin's
+	// "opt-in protection" model.
+	if expected == "" {
+		if _, hasSave := query["save"]; hasSave {
+			return saveFromQuery(query, req)
+		}
+		return okEnvelope(htmlResponse(renderUI("", true)))
 	}
-	if values, ok := query["saved"]; ok && len(values) > 0 && values[0] == "1" {
-		return "已更新当前进程内的配置。重启 CPA 后以 config.yaml 为准，请同步修改配置文件以持久化。"
+
+	if token := cookieValue(req.Headers, accessCookieName); token != "" && sessionValid(token) {
+		if _, hasSave := query["save"]; hasSave {
+			return saveFromQuery(query, req)
+		}
+		return okEnvelope(htmlResponse(renderUI("", true)))
 	}
-	return ""
+
+	if provided, ok := query["password"]; ok {
+		if constantTimeEqual(provided, expected) {
+			token := newSessionToken()
+			body := renderUI("已验证，配置已可编辑。", true)
+			response := htmlResponse(body)
+			response.Headers["Set-Cookie"] = []string{cookieHeader(token)}
+			return okEnvelope(response)
+		}
+		return okEnvelope(htmlResponse(renderLogin("口令不正确。")))
+	}
+
+	return okEnvelope(htmlResponse(renderLogin("")))
 }
 
-// applyConfigForm accepts form-encoded or JSON bodies and updates the live
-// configuration. It only changes in-memory state; persistence belongs to
-// config.yaml so restarts stay predictable.
-func applyConfigForm(body []byte) ([]byte, error) {
-	values, errParse := parseConfigBody(body)
-	if errParse != nil {
-		return okEnvelope(jsonErrorResponse(400, errParse.Error()))
+func saveFromQuery(query map[string]string, req *managementRequest) ([]byte, error) {
+	expected := currentPassword()
+	if expected != "" {
+		token := cookieValue(req.Headers, accessCookieName)
+		if token == "" || !sessionValid(token) {
+			return okEnvelope(htmlResponse(renderLogin("会话已过期，请重新输入口令。")))
+		}
 	}
 
 	cfgState.mu.Lock()
@@ -576,14 +629,14 @@ func applyConfigForm(body []byte) ([]byte, error) {
 	if next.Headers == nil {
 		next.Headers = map[string]string{}
 	}
-	next.Enabled = truthy(values["enabled"])
-	if raw, ok := values["base_url"]; ok {
+	next.Enabled = truthy(query["enabled"])
+	if raw, ok := query["base_url"]; ok {
 		next.BaseURL = strings.TrimSpace(raw)
 	}
-	if raw, ok := values["mode"]; ok && strings.TrimSpace(raw) != "" {
+	if raw, ok := query["mode"]; ok && strings.TrimSpace(raw) != "" {
 		next.Mode = strings.TrimSpace(raw)
 	}
-	if raw, ok := values["headers"]; ok {
+	if raw, ok := query["headers"]; ok {
 		next.Headers = parseHeaderBlock(raw)
 	}
 	cfgState.current = next
@@ -592,12 +645,104 @@ func applyConfigForm(body []byte) ([]byte, error) {
 	logf("ui update enabled=%v base_url=%q mode=%q headers=%d",
 		next.Enabled, next.BaseURL, next.Mode, len(next.Headers))
 
-	redirect := managementResponse{
-		StatusCode: 303,
-		Headers:    map[string][]string{"Location": {"/v0/management/codex-relay/ui?saved=1"}},
-		Body:       []byte{},
+	response := htmlResponse(renderUI("已保存并立即生效。重启 CPA 后以 config.yaml 为准，请同步修改配置文件以持久化。", true))
+	return okEnvelope(response)
+}
+
+func currentPassword() string {
+	cfgState.mu.RLock()
+	defer cfgState.mu.RUnlock()
+	return strings.TrimSpace(cfgState.current.Password)
+}
+
+func constantTimeEqual(left, right string) bool {
+	if len(left) != len(right) {
+		return false
 	}
-	return okEnvelope(redirect)
+	mismatch := byte(0)
+	for i := 0; i < len(left); i++ {
+		mismatch |= left[i] ^ right[i]
+	}
+	return mismatch == 0
+}
+
+func newSessionToken() string {
+	buf := make([]byte, 32)
+	if file, errOpen := os.Open("/dev/urandom"); errOpen == nil {
+		if _, errRead := file.Read(buf); errRead != nil {
+			fallbackFill(buf)
+		}
+		_ = file.Close()
+	} else {
+		fallbackFill(buf)
+	}
+	token := fmt.Sprintf("%x", buf)
+	sessionState.mu.Lock()
+	sessionState.tokens[token] = time.Now().Add(sessionTTL)
+	sessionState.mu.Unlock()
+	return token
+}
+
+// fallbackFill is only reached when /dev/urandom is unavailable; it mixes the
+// nanosecond clock so tokens stay unpredictable enough for a local admin page.
+func fallbackFill(buf []byte) {
+	seed := time.Now().UnixNano()
+	for i := range buf {
+		seed = seed*6364136223846793005 + 1442695040888963407
+		buf[i] = byte(seed >> 33)
+	}
+}
+
+func sessionValid(token string) bool {
+	sessionState.mu.Lock()
+	defer sessionState.mu.Unlock()
+	expires, ok := sessionState.tokens[token]
+	if !ok {
+		return false
+	}
+	if time.Now().After(expires) {
+		delete(sessionState.tokens, token)
+		return false
+	}
+	return true
+}
+
+func cookieHeader(token string) string {
+	return fmt.Sprintf("%s=%s; Path=%s; Max-Age=%d; HttpOnly; SameSite=Lax",
+		accessCookieName, token, resourceBase, int(sessionTTL.Seconds()))
+}
+
+func cookieValue(headers map[string][]string, name string) string {
+	if headers == nil {
+		return ""
+	}
+	raw, ok := headers["Cookie"]
+	if !ok {
+		raw, ok = headers["cookie"]
+		if !ok {
+			return ""
+		}
+	}
+	for _, line := range raw {
+		for _, part := range strings.Split(line, ";") {
+			part = strings.TrimSpace(part)
+			if !strings.HasPrefix(part, name+"=") {
+				continue
+			}
+			return strings.TrimSpace(strings.TrimPrefix(part, name+"="))
+		}
+	}
+	return ""
+}
+
+func queryFirst(query map[string][]string) map[string]string {
+	out := map[string]string{}
+	for key, values := range query {
+		if len(values) > 0 {
+			out[key] = values[0]
+		}
+	}
+	return out
 }
 
 func truthy(value string) bool {
@@ -606,45 +751,6 @@ func truthy(value string) bool {
 		return true
 	}
 	return false
-}
-
-func parseConfigBody(body []byte) (map[string]string, error) {
-	trimmed := strings.TrimSpace(string(body))
-	out := map[string]string{}
-	if strings.HasPrefix(trimmed, "{") {
-		var decoded map[string]any
-		if errUnmarshal := json.Unmarshal([]byte(trimmed), &decoded); errUnmarshal != nil {
-			return nil, fmt.Errorf("invalid json body: %w", errUnmarshal)
-		}
-		for key, value := range decoded {
-			switch typed := value.(type) {
-			case string:
-				out[key] = typed
-			case bool:
-				if typed {
-					out[key] = "true"
-				} else {
-					out[key] = "false"
-				}
-			default:
-				encoded, errMarshal := json.Marshal(typed)
-				if errMarshal == nil {
-					out[key] = string(encoded)
-				}
-			}
-		}
-		return out, nil
-	}
-	parsed, errParse := url.ParseQuery(trimmed)
-	if errParse != nil {
-		return nil, fmt.Errorf("invalid form body: %w", errParse)
-	}
-	for key, values := range parsed {
-		if len(values) > 0 {
-			out[key] = values[0]
-		}
-	}
-	return out, nil
 }
 
 // parseHeaderBlock reads a simple "Name: value" list, one entry per line.
@@ -711,19 +817,27 @@ func htmlResponse(body string) managementResponse {
 	}
 }
 
-// renderMenuLanding is served from the unauthenticated resource route. The
-// configuration page itself lives behind management auth, so this page only
-// points at it and never discloses the upstream URL.
-func renderMenuLanding() string {
-	return pageShell(`<div class="card">
-<h1>Codex Relay Router</h1>
-<p class="sub">配置页需要管理鉴权，请在管理面板中打开下列地址。</p>
-<p><code>GET /v0/management/codex-relay/ui</code></p>
-<p class="dim">本入口免鉴权，因此不展示上游地址等敏感信息。</p>
-</div>`)
+// renderLogin asks for the plugin access password.
+func renderLogin(message string) string {
+	notice := ""
+	if message != "" {
+		notice = `<div class="notice">` + htmlEscape(message) + `</div>`
+	}
+	body := fmt.Sprintf(`
+%s
+<div class="card">
+<h1>Codex 上游路由</h1>
+<p class="sub">此页面受插件访问口令保护。请输入 <code>plugins.configs.plugin-codex-relay.password</code> 中配置的口令。</p>
+<form method="get" action="%s/ui">
+  <div class="row"><span class="lbl">访问口令</span>
+    <input type="password" name="password" autocomplete="current-password" autofocus></div>
+  <button type="submit">进入</button>
+</form>
+</div>`, notice, resourceBase)
+	return pageShell(body)
 }
 
-func renderUI(savedMessage string) string {
+func renderUI(savedMessage string, editable bool) string {
 	cfgState.mu.RLock()
 	cfg := cfgState.current
 	cfgState.mu.RUnlock()
@@ -761,12 +875,11 @@ func renderUI(savedMessage string) string {
 		notice = `<div class="notice">` + htmlEscape(savedMessage) + `</div>`
 	}
 
-	body := fmt.Sprintf(`
-%s
-<div class="card">
-<h1>Codex 上游路由</h1>
-<p class="sub">把 Codex OAuth 凭据的请求改发到指定网关，无需修改 CPA 源码。保存后立即生效，但仅存在于内存中；重启后以 <code>config.yaml</code> 为准。</p>
-<form method="post" action="/v0/management/codex-relay/config">
+	formBlock := ""
+	if editable {
+		formBlock = fmt.Sprintf(`
+<form method="get" action="%s/ui">
+  <input type="hidden" name="save" value="1">
   <label class="row"><input type="checkbox" name="enabled"%s> 启用接管</label>
   <div class="row"><span class="lbl">上游地址 base_url</span>
     <input type="text" name="base_url" value="%s" placeholder="http://172.19.0.1:8320/backend-api/codex"></div>
@@ -775,7 +888,18 @@ func renderUI(savedMessage string) string {
   <div class="row"><span class="lbl">附加请求头（每行一条 Name: value）</span>
     <textarea name="headers" rows="4" placeholder="X-Foo: bar">%s</textarea></div>
   <button type="submit">保存</button>
-</form>
+</form>`, resourceBase, enabledChecked, htmlEscape(cfg.BaseURL), allSelected, optinSelected,
+			htmlEscape(strings.Join(headerLines, "\n")))
+	} else {
+		formBlock = `<p class="sub">当前为只读视图。</p>`
+	}
+
+	body := fmt.Sprintf(`
+%s
+<div class="card">
+<h1>Codex 上游路由</h1>
+<p class="sub">把 Codex OAuth 凭据的请求改发到指定网关，无需修改 CPA 源码。保存后立即生效，但仅存在于内存中；重启后以 <code>config.yaml</code> 为准。</p>
+%s
 </div>
 <div class="card">
 <h2>当前状态</h2>
@@ -788,8 +912,7 @@ func renderUI(savedMessage string) string {
 <tr><th>最近文件</th><td class="dim">%s</td></tr>
 <tr><th>最近时间</th><td class="dim">%s</td></tr>
 </tbody></table>
-</div>`, notice, enabledChecked, htmlEscape(cfg.BaseURL), allSelected, optinSelected,
-		htmlEscape(strings.Join(headerLines, "\n")),
+</div>`, notice, formBlock,
 		boolText(cfg.Enabled), htmlEscape(orDefault(cfg.BaseURL, "(未设置)")),
 		htmlEscape(orDefault(cfg.Mode, "all")),
 		fmt.Sprintf("%d", adopted), fmt.Sprintf("%d", skipped),
@@ -829,6 +952,13 @@ font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
 .dim{color:var(--dim);font-family:ui-monospace,Menlo,monospace;font-size:12px}
 .notice{background:var(--wbg);color:var(--warn);border-radius:8px;padding:10px 14px;margin-bottom:14px;
 font-size:13px;max-width:760px}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600}
+.pill.on{background:#d1fae5;color:#065f46}
+.pill.off{background:#e5e7eb;color:#6b7280}
+.note-line{margin:12px 0 0}
+.btn{display:inline-block;background:var(--ac);color:#fff;text-decoration:none;
+border-radius:7px;padding:9px 18px;font-size:14px}
+.btn:hover{filter:brightness(1.08)}
 </style></head><body>` + body + `</body></html>`
 }
 
