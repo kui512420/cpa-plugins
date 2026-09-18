@@ -42,6 +42,25 @@ plugins:
 `auth.refresh` 返回空 payload，让 CPA 合并原有 metadata 与 attributes，
 从而**保留注入的 `base_url`**。若在此返回新 auth 而不带该属性，刷新后路由会回落。
 
+## 管理界面
+
+| 路由 | 鉴权 | 说明 |
+|---|---|---|
+| `GET /v0/management/codex-relay/ui` | 需要 | 配置页面（HTML 表单） |
+| `POST /v0/management/codex-relay/config` | 需要 | 保存配置 |
+| `GET /v0/management/codex-relay/status` | 需要 | 当前状态 JSON |
+| `GET /v0/resource/plugins/plugin-codex-relay/home` | 免鉴权 | 菜单入口，仅指向配置页 |
+
+配置页会显示并允许修改：启用开关、`base_url`、`mode`（all/optin）、附加请求头，
+以及已接管次数 / 跳过文件数等运行状态。
+
+> **安全设计**：配置页与写接口都放在 `management` 路由下，走管理鉴权。
+> CPA 会把「GET + 带 `Menu`」的路由降级为**免鉴权** resource 路由，因此菜单入口
+> 单独注册且不渲染上游地址，避免敏感信息泄漏。
+
+> **持久化**：界面保存只改内存，立即生效；重启后以 `config.yaml` 为准。
+> 需要长期生效请同步改配置文件。
+
 ## 验证
 
 部署后重启，日志应出现 `adopted` 而非 `skipped`：
@@ -53,4 +72,9 @@ docker logs cpa 2>&1 | grep 'plugin-codex-relay'
 
 若全是 `unparsable`，通常是 ABI 的 `[]byte` 字段没按 base64 解码（见仓库 README 的坑）。
 
-管理面板资源：`/v0/resource/plugins/plugin-codex-relay/status`
+界面自检：
+
+```sh
+curl -s -H "Authorization: Bearer <management-key>" \
+  http://127.0.0.1:8317/v0/management/codex-relay/status
+```

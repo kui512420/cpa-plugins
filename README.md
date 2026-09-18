@@ -8,7 +8,7 @@ CLIProxyAPI (CPA) 插件集合。**不改 CPA 源码** —— 全部通过官方
 
 | 插件 | 作用 | 状态 |
 |---|---|---|
-| [`plugin-codex-relay`](plugins/plugin-codex-relay/) | 把 Codex OAuth 凭据的上游改到指定网关（如 codex-relay），替代改源码或 `codex-api-key.base-url` | 已验证 |
+| [`plugin-codex-relay`](plugins/plugin-codex-relay/) | 把 Codex OAuth 凭据的上游改到指定网关（如 codex-relay）；带管理界面，可在面板中改 `base_url`/`mode`/请求头 | 已验证 |
 | [`plugin-o`](plugins/plugin-o/) | 检测「请求模型」与「上游实际服务模型」不一致 | 已部署 |
 
 ## 核心机制
@@ -96,3 +96,7 @@ docker logs cpa 2>&1 | grep -i 'plugin'
 - **配置是嵌套 YAML，不是扁平的**：插件收到的 `config_yaml` 是 map 序列化的 YAML，带缩进。
   手写解析要按缩进判断层级；简单起见用 `gopkg.in/yaml.v3`（但会增加依赖）。
 - 改配置后 CPA 会热重载，插件会 unload→load，日志里出现多轮 `configured` 属正常。
+- **写接口不要放 resource 路由**：`GET + Menu` 的组合会被降级为免鉴权路由，
+  配置页和 POST 接口必须用 `management` 路由（不带 `Menu`）才带鉴权。
+- **resource 路由的 Path 不能以 `/` 结尾**：传 `"/"` 会被规范化为空而丢弃，用 `"/home"` 这类具体路径。
+- **management 响应体在 schema < 6 会被 HTML 转义**：声明 `schema_version >= 6` 才能安全返回 HTML 页面。

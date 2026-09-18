@@ -36,7 +36,9 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -77,6 +79,20 @@ type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
 }
 
+type managementRequest struct {
+	Method  string              `json:"Method"`
+	Path    string              `json:"Path"`
+	Headers map[string][]string `json:"Headers,omitempty"`
+	Query   map[string][]string `json:"Query,omitempty"`
+	Body    []byte              `json:"Body,omitempty"`
+}
+
+type managementResponse struct {
+	StatusCode int                 `json:"StatusCode"`
+	Headers    map[string][]string `json:"Headers,omitempty"`
+	Body       []byte              `json:"Body"`
+}
+
 // authParseRequest mirrors pluginapi.AuthParseRequest.
 // RawJSON is []byte (not json.RawMessage) so encoding/json performs the
 // base64 round-trip the host uses for byte-slice fields.
@@ -115,9 +131,9 @@ type pluginConfig struct {
 }
 
 type registration struct {
-	SchemaVersion uint32                 `json:"schema_version"`
-	Metadata      map[string]any         `json:"metadata"`
-	Capabilities  map[string]bool        `json:"capabilities"`
+	SchemaVersion uint32          `json:"schema_version"`
+	Metadata      map[string]any  `json:"metadata"`
+	Capabilities  map[string]bool `json:"capabilities"`
 }
 
 var cfgState = struct {
@@ -197,7 +213,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case methodManagementReg:
 		return okEnvelope(managementRegistration())
 	case methodManagementHandle:
-		return managementHandle()
+		return managementHandle(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -219,9 +235,17 @@ func configure(raw []byte) error {
 	return nil
 }
 
-// parsePluginConfig reads the flat plugin config keys emitted by the host.
+// parsePluginConfig reads the config block the host emits for this plugin.
+// The host serialises the config map, so keys keep their nesting and headers
+// appear as an indented sub-map.
 func parsePluginConfig(raw []byte) pluginConfig {
-	cfg := pluginConfig{Headers: map[string]string{}}
+	cfg := pluginConfig{Headers: map[string]string{}, Mode: "all"}
+	if len(raw) == 0 {
+		return cfg
+	}
+	if decoded, ok := decodeJSONObject(raw); ok {
+		return configFromMap(decoded)
+	}
 	inHeaders := false
 	for _, line := range strings.Split(string(raw), "\n") {
 		trimmed := strings.TrimRight(line, "\r")
@@ -235,6 +259,9 @@ func parsePluginConfig(raw []byte) pluginConfig {
 		}
 		key, value, hasValue := splitYAMLKeyValue(entry)
 		if !hasValue {
+			if indent == 0 && strings.EqualFold(key, "headers") {
+				inHeaders = true
+			}
 			continue
 		}
 		value = trimYAMLQuotes(strings.TrimSpace(value))
@@ -248,12 +275,50 @@ func parsePluginConfig(raw []byte) pluginConfig {
 			case "mode":
 				cfg.Mode = value
 			case "headers":
-				inHeaders = true
+				inHeaders = strings.TrimSpace(value) == ""
 			}
 			continue
 		}
 		if inHeaders {
 			cfg.Headers[key] = value
+		}
+	}
+	return cfg
+}
+
+// decodeJSONObject reads the config body when the host hands over JSON.
+func decodeJSONObject(raw []byte) (map[string]any, bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil, false
+	}
+	var decoded map[string]any
+	if errUnmarshal := json.Unmarshal([]byte(trimmed), &decoded); errUnmarshal != nil {
+		return nil, false
+	}
+	return decoded, true
+}
+
+func configFromMap(decoded map[string]any) pluginConfig {
+	cfg := pluginConfig{Headers: map[string]string{}, Mode: "all"}
+	if v, ok := decoded["enabled"].(bool); ok {
+		cfg.Enabled = v
+	}
+	if v, ok := decoded["base_url"].(string); ok {
+		cfg.BaseURL = strings.TrimSpace(v)
+	}
+	if v, ok := decoded["mode"].(string); ok && strings.TrimSpace(v) != "" {
+		cfg.Mode = strings.TrimSpace(v)
+	}
+	if headers, ok := decoded["headers"].(map[string]any); ok {
+		for name, value := range headers {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if text, isString := value.(string); isString {
+				cfg.Headers[name] = strings.TrimSpace(text)
+			}
 		}
 	}
 	return cfg
@@ -281,9 +346,9 @@ func pluginRegistration() registration {
 		SchemaVersion: schemaVersion,
 		Metadata: map[string]any{
 			"Name":             "Codex Relay Router",
-			"Version":          "0.1.0",
+			"Version":          "0.2.0",
 			"Author":           "kui",
-			"GitHubRepository": "https://github.com/router-for-me/CLIProxyAPI",
+			"GitHubRepository": "https://github.com/kui512420/cpa-plugins",
 			"ConfigFields": []map[string]any{
 				{"Name": "enabled", "Type": "boolean", "Description": "Adopt codex OAuth auth files and route them to a custom upstream."},
 				{"Name": "base_url", "Type": "string", "Description": "Upstream Codex base URL, e.g. http://172.19.0.1:8320/backend-api/codex"},
@@ -436,22 +501,176 @@ func markSkipped(fileName, reason string) {
 
 func managementRegistration() map[string]any {
 	return map[string]any{
+		"routes": []map[string]any{
+			{
+				"Method":      "GET",
+				"Path":        "/codex-relay/ui",
+				"Description": "Codex Relay Router configuration page.",
+			},
+			{
+				"Method":      "POST",
+				"Path":        "/codex-relay/config",
+				"Description": "Update Codex Relay Router runtime configuration.",
+			},
+			{
+				"Method":      "GET",
+				"Path":        "/codex-relay/status",
+				"Description": "Codex Relay Router status as JSON.",
+			},
+		},
 		"resources": []map[string]string{
 			{
-				"Path":        "/status",
+				"Path":        "/home",
 				"Menu":        "Codex Relay Router",
-				"Description": "Shows the relay base URL adopted by codex OAuth credentials.",
+				"Description": "Opens the authenticated configuration page.",
 			},
 		},
 	}
 }
 
-func managementHandle() ([]byte, error) {
+func managementHandle(raw []byte) ([]byte, error) {
+	var req managementRequest
+	if len(raw) > 0 {
+		if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	path := strings.TrimRight(strings.TrimSpace(req.Path), "/")
+
+	switch {
+	case method == "GET" && path == "/v0/management/codex-relay/ui":
+		return okEnvelope(htmlResponse(renderUI(savedMessageFromQuery(req.Query))))
+	case method == "GET" && path == "/v0/resource/plugins/plugin-codex-relay/home":
+		return okEnvelope(htmlResponse(renderMenuLanding()))
+	case method == "GET" && path == "/v0/management/codex-relay/status":
+		return okEnvelope(jsonResponse(statusReport()))
+	case method == "POST" && path == "/v0/management/codex-relay/config":
+		return applyConfigForm(req.Body)
+	default:
+		return okEnvelope(jsonErrorResponse(404, "not found: "+method+" "+path))
+	}
+}
+
+func savedMessageFromQuery(query map[string][]string) string {
+	if query == nil {
+		return ""
+	}
+	if values, ok := query["saved"]; ok && len(values) > 0 && values[0] == "1" {
+		return "已更新当前进程内的配置。重启 CPA 后以 config.yaml 为准，请同步修改配置文件以持久化。"
+	}
+	return ""
+}
+
+// applyConfigForm accepts form-encoded or JSON bodies and updates the live
+// configuration. It only changes in-memory state; persistence belongs to
+// config.yaml so restarts stay predictable.
+func applyConfigForm(body []byte) ([]byte, error) {
+	values, errParse := parseConfigBody(body)
+	if errParse != nil {
+		return okEnvelope(jsonErrorResponse(400, errParse.Error()))
+	}
+
+	cfgState.mu.Lock()
+	next := cfgState.current
+	if next.Headers == nil {
+		next.Headers = map[string]string{}
+	}
+	next.Enabled = truthy(values["enabled"])
+	if raw, ok := values["base_url"]; ok {
+		next.BaseURL = strings.TrimSpace(raw)
+	}
+	if raw, ok := values["mode"]; ok && strings.TrimSpace(raw) != "" {
+		next.Mode = strings.TrimSpace(raw)
+	}
+	if raw, ok := values["headers"]; ok {
+		next.Headers = parseHeaderBlock(raw)
+	}
+	cfgState.current = next
+	cfgState.mu.Unlock()
+
+	logf("ui update enabled=%v base_url=%q mode=%q headers=%d",
+		next.Enabled, next.BaseURL, next.Mode, len(next.Headers))
+
+	redirect := managementResponse{
+		StatusCode: 303,
+		Headers:    map[string][]string{"Location": {"/v0/management/codex-relay/ui?saved=1"}},
+		Body:       []byte{},
+	}
+	return okEnvelope(redirect)
+}
+
+func truthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "on", "true", "1", "yes":
+		return true
+	}
+	return false
+}
+
+func parseConfigBody(body []byte) (map[string]string, error) {
+	trimmed := strings.TrimSpace(string(body))
+	out := map[string]string{}
+	if strings.HasPrefix(trimmed, "{") {
+		var decoded map[string]any
+		if errUnmarshal := json.Unmarshal([]byte(trimmed), &decoded); errUnmarshal != nil {
+			return nil, fmt.Errorf("invalid json body: %w", errUnmarshal)
+		}
+		for key, value := range decoded {
+			switch typed := value.(type) {
+			case string:
+				out[key] = typed
+			case bool:
+				if typed {
+					out[key] = "true"
+				} else {
+					out[key] = "false"
+				}
+			default:
+				encoded, errMarshal := json.Marshal(typed)
+				if errMarshal == nil {
+					out[key] = string(encoded)
+				}
+			}
+		}
+		return out, nil
+	}
+	parsed, errParse := url.ParseQuery(trimmed)
+	if errParse != nil {
+		return nil, fmt.Errorf("invalid form body: %w", errParse)
+	}
+	for key, values := range parsed {
+		if len(values) > 0 {
+			out[key] = values[0]
+		}
+	}
+	return out, nil
+}
+
+// parseHeaderBlock reads a simple "Name: value" list, one entry per line.
+func parseHeaderBlock(raw string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(raw, "\n") {
+		entry := strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if entry == "" {
+			continue
+		}
+		key, value, hasValue := splitYAMLKeyValue(entry)
+		if !hasValue || key == "" {
+			continue
+		}
+		out[key] = trimYAMLQuotes(strings.TrimSpace(value))
+	}
+	return out
+}
+
+func statusReport() map[string]any {
 	cfgState.mu.RLock()
 	cfg := cfgState.current
 	cfgState.mu.RUnlock()
 	counters.mu.Lock()
-	report := map[string]any{
+	defer counters.mu.Unlock()
+	return map[string]any{
 		"enabled":        cfg.Enabled,
 		"base_url":       strings.TrimSpace(cfg.BaseURL),
 		"mode":           strings.TrimSpace(cfg.Mode),
@@ -461,20 +680,179 @@ func managementHandle() ([]byte, error) {
 		"last_auth_file": counters.lastFile,
 		"last_observed":  counters.lastAt,
 	}
-	counters.mu.Unlock()
-	return okEnvelope(managementResponse(report))
 }
 
-func managementResponse(report map[string]any) map[string]any {
+func jsonResponse(report map[string]any) managementResponse {
 	body, errMarshal := json.MarshalIndent(report, "", "  ")
 	if errMarshal != nil {
 		body = []byte("{}")
 	}
-	return map[string]any{
-		"StatusCode": 200,
-		"Headers":    map[string][]string{"content-type": {"application/json; charset=utf-8"}},
-		"Body":       body,
+	return managementResponse{
+		StatusCode: 200,
+		Headers:    map[string][]string{"content-type": {"application/json; charset=utf-8"}},
+		Body:       body,
 	}
+}
+
+func jsonErrorResponse(status int, message string) managementResponse {
+	body, _ := json.Marshal(map[string]any{"error": message})
+	return managementResponse{
+		StatusCode: status,
+		Headers:    map[string][]string{"content-type": {"application/json; charset=utf-8"}},
+		Body:       body,
+	}
+}
+
+func htmlResponse(body string) managementResponse {
+	return managementResponse{
+		StatusCode: 200,
+		Headers:    map[string][]string{"content-type": {"text/html; charset=utf-8"}},
+		Body:       []byte(body),
+	}
+}
+
+// renderMenuLanding is served from the unauthenticated resource route. The
+// configuration page itself lives behind management auth, so this page only
+// points at it and never discloses the upstream URL.
+func renderMenuLanding() string {
+	return pageShell(`<div class="card">
+<h1>Codex Relay Router</h1>
+<p class="sub">配置页需要管理鉴权，请在管理面板中打开下列地址。</p>
+<p><code>GET /v0/management/codex-relay/ui</code></p>
+<p class="dim">本入口免鉴权，因此不展示上游地址等敏感信息。</p>
+</div>`)
+}
+
+func renderUI(savedMessage string) string {
+	cfgState.mu.RLock()
+	cfg := cfgState.current
+	cfgState.mu.RUnlock()
+	counters.mu.Lock()
+	adopted := counters.adopted
+	skipped := counters.skipped
+	lastFile := counters.lastFile
+	lastAt := counters.lastAt
+	counters.mu.Unlock()
+
+	enabledChecked := ""
+	if cfg.Enabled {
+		enabledChecked = " checked"
+	}
+	allSelected := ""
+	optinSelected := ""
+	if strings.EqualFold(strings.TrimSpace(cfg.Mode), "optin") {
+		optinSelected = " selected"
+	} else {
+		allSelected = " selected"
+	}
+
+	names := make([]string, 0, len(cfg.Headers))
+	for name := range cfg.Headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	headerLines := make([]string, 0, len(names))
+	for _, name := range names {
+		headerLines = append(headerLines, name+": "+cfg.Headers[name])
+	}
+
+	notice := ""
+	if savedMessage != "" {
+		notice = `<div class="notice">` + htmlEscape(savedMessage) + `</div>`
+	}
+
+	body := fmt.Sprintf(`
+%s
+<div class="card">
+<h1>Codex 上游路由</h1>
+<p class="sub">把 Codex OAuth 凭据的请求改发到指定网关，无需修改 CPA 源码。保存后立即生效，但仅存在于内存中；重启后以 <code>config.yaml</code> 为准。</p>
+<form method="post" action="/v0/management/codex-relay/config">
+  <label class="row"><input type="checkbox" name="enabled"%s> 启用接管</label>
+  <div class="row"><span class="lbl">上游地址 base_url</span>
+    <input type="text" name="base_url" value="%s" placeholder="http://172.19.0.1:8320/backend-api/codex"></div>
+  <div class="row"><span class="lbl">接管范围 mode</span>
+    <select name="mode"><option value="all"%s>all — 接管所有 codex OAuth 文件</option><option value="optin"%s>optin — 仅接管标记文件</option></select></div>
+  <div class="row"><span class="lbl">附加请求头（每行一条 Name: value）</span>
+    <textarea name="headers" rows="4" placeholder="X-Foo: bar">%s</textarea></div>
+  <button type="submit">保存</button>
+</form>
+</div>
+<div class="card">
+<h2>当前状态</h2>
+<table><tbody>
+<tr><th>启用</th><td>%s</td></tr>
+<tr><th>上游地址</th><td><code>%s</code></td></tr>
+<tr><th>接管范围</th><td><code>%s</code></td></tr>
+<tr><th>已接管次数</th><td>%s</td></tr>
+<tr><th>跳过文件数</th><td>%s</td></tr>
+<tr><th>最近文件</th><td class="dim">%s</td></tr>
+<tr><th>最近时间</th><td class="dim">%s</td></tr>
+</tbody></table>
+</div>`, notice, enabledChecked, htmlEscape(cfg.BaseURL), allSelected, optinSelected,
+		htmlEscape(strings.Join(headerLines, "\n")),
+		boolText(cfg.Enabled), htmlEscape(orDefault(cfg.BaseURL, "(未设置)")),
+		htmlEscape(orDefault(cfg.Mode, "all")),
+		fmt.Sprintf("%d", adopted), fmt.Sprintf("%d", skipped),
+		htmlEscape(orDefault(lastFile, "—")), htmlEscape(orDefault(lastAt, "—")))
+
+	return pageShell(body)
+}
+
+func pageShell(body string) string {
+	return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Codex 上游路由</title>
+<style>
+:root{--bg:#f7f8fa;--card:#fff;--bd:#e5e7eb;--tx:#111827;--dim:#6b7280;--ac:#2563eb;--warn:#b45309;--wbg:#fef3c7}
+*{box-sizing:border-box}
+body{margin:0;padding:28px;background:var(--bg);color:var(--tx);
+font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+h1{font-size:20px;margin:0 0 6px}
+h2{font-size:15px;margin:0 0 12px;color:#374151}
+.sub{color:var(--dim);font-size:13px;margin:0 0 18px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:18px 20px;margin-bottom:14px;max-width:760px}
+.row{display:block;margin-bottom:14px}
+.lbl{display:block;font-size:13px;color:#374151;margin-bottom:5px;font-weight:600}
+input[type=text],textarea,select{width:100%;padding:8px 10px;border:1px solid var(--bd);border-radius:7px;
+font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#fff}
+textarea{resize:vertical}
+input[type=checkbox]{width:16px;height:16px;vertical-align:-2px;margin-right:6px}
+button{background:var(--ac);color:#fff;border:0;border-radius:7px;padding:9px 18px;font-size:14px;cursor:pointer}
+button:hover{filter:brightness(1.08)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--bd)}
+th{width:130px;color:#374151;font-weight:600;background:#f9fafb}
+tr:last-child td,tr:last-child th{border-bottom:none}
+code{background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:12.5px;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+.dim{color:var(--dim);font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.notice{background:var(--wbg);color:var(--warn);border-radius:8px;padding:10px 14px;margin-bottom:14px;
+font-size:13px;max-width:760px}
+</style></head><body>` + body + `</body></html>`
+}
+
+func orDefault(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
+}
+
+func boolText(value bool) string {
+	if value {
+		return "是"
+	}
+	return "否"
+}
+
+func htmlEscape(value string) string {
+	value = strings.ReplaceAll(value, "&", "&amp;")
+	value = strings.ReplaceAll(value, "<", "&lt;")
+	value = strings.ReplaceAll(value, ">", "&gt;")
+	value = strings.ReplaceAll(value, `"`, "&quot;")
+	value = strings.ReplaceAll(value, "'", "&#39;")
+	return value
 }
 
 func logf(format string, args ...any) {
